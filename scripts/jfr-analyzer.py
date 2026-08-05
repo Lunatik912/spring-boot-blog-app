@@ -296,6 +296,33 @@ def stack_signature(frames: list, depth: int = 4) -> str:
     return " -> ".join(method_sig(f)[:80] for f in frames[:depth])
 
 
+def is_app_frame(frame: dict) -> bool:
+    """
+    Filter out JDK/framework frames to surface application code.
+
+    Returns True if the frame is NOT in a known library package.
+    This is used to filter stack traces for contention and I/O events
+    so the report shows app-level call sites rather than library internals.
+    """
+    name = dig(frame, 'method', 'type', 'name', default='')
+    skip_prefixes = (
+        'java/', 'javax/', 'jdk/', 'sun/', 'org/springframework/',
+        'org/apache/', 'org/hibernate/', 'com/zaxxer/',
+    )
+    return not any(name.startswith(s) for s in skip_prefixes)
+
+
+def app_stack_frames(frames: list, max_frames: int = 8) -> list:
+    """
+    Return the first `max_frames` application-code frames from a stack trace.
+    Falls back to all frames if no app frames are found.
+    """
+    app_frames = [f for f in frames if is_app_frame(f)]
+    if app_frames:
+        return app_frames[:max_frames]
+    return frames[:max_frames]
+
+
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║                     JFR DATA MODEL (JfrAnalysis)                             ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -331,6 +358,8 @@ JSON_EVENTS = {
     "file_write_events":      "jdk.FileWrite",
     "cpu_load_events":        "jdk.CPULoad",
     "exception_events":       "jdk.JavaExceptionThrow",
+    "error_throw_events":     "jdk.JavaErrorThrow",
+    "gc_config_events":       "jdk.GCConfiguration",
 }
 
 
@@ -502,6 +531,23 @@ class JfrAnalysis:
         for s in self.cpu_samples:
             sig = " -> ".join(f[:90] for f in s["frames"][:depth])
             c[sig] += 1
+        return c
+
+    def cpu_caller_counts(self) -> Counter:
+        """
+        Group CPU samples by the second stack frame (the immediate caller).
+
+        The leaf frame (index 0) tells WHAT is hot; the caller frame (index 1)
+        tells WHO is calling it — useful for distinguishing different call
+        paths that share the same leaf. For example, Inflater.inflateBytes
+        might be called from both JAR reading and HTTP decompression.
+        """
+        c: Counter[str] = Counter()
+        for s in self.cpu_samples:
+            if len(s["frames"]) >= 2:
+                c[s["frames"][1]] += 1
+            elif s["frames"]:
+                c[f"(leaf only: {s['frames'][0][:60]})"] += 1
         return c
 
     @property
@@ -703,6 +749,36 @@ class JfrAnalysis:
                 other_ms += ms
         return young_ms, old_ms, other_ms
 
+    def gc_configuration(self) -> dict:
+        """
+        Extract GC algorithm and collector configuration.
+
+        Returns a dict with keys like 'youngCollector', 'oldCollector',
+        'youngGeneration', 'oldGeneration' — empty if jdk.GCConfiguration
+        was not recorded (JDK version dependent).
+        """
+        if not self.gc_config_events:
+            return {}
+        return self.gc_config_events[-1].get("values", {})
+
+    @property
+    def gc_algorithm_name(self) -> str:
+        """Human-readable GC algorithm name, e.g. 'G1' or 'ZGC'."""
+        cfg = self.gc_configuration()
+        if not cfg:
+            return "unknown"
+        old = cfg.get("oldCollector", "") or ""
+        young = cfg.get("youngCollector", "") or ""
+        # Normalize common collector names
+        for name in (old, young):
+            if name and "G1" in name.upper():
+                return name
+            if name and "ZGC" in name.upper():
+                return name
+            if name and "Shenandoah" in name:
+                return name
+        return old or young or "unknown"
+
     # ── Safepoint Accessors ──────────────────────────────────────────────
 
     @property
@@ -875,6 +951,96 @@ class JfrAnalysis:
     def thread_park_total_ms(self) -> float:
         return sum(parse_duration_iso(e["values"].get("duration", 0)) for e in self.thread_park_events)
 
+    def monitor_contention_distribution(self) -> Counter:
+        """
+        Distribution buckets for monitor enter durations.
+
+        Returns Counter mapping bucket label -> event count.
+        Buckets: 0-1ms, 1-5ms, 5-10ms, 10-50ms, 50-100ms, 100-500ms, 500ms+.
+
+        The distribution shape reveals whether contention is dominated by
+        quick grabs (first few buckets) or long stalls (upper buckets).
+        Note: JFR only records monitor-contention events above a threshold
+        (commonly 20ms by default) — shorter events won't appear unless
+        that threshold was lowered.
+        """
+        buckets: Counter[str] = Counter()
+        buckets["0-1ms"] = 0
+        buckets["1-5ms"] = 0
+        buckets["5-10ms"] = 0
+        buckets["10-50ms"] = 0
+        buckets["50-100ms"] = 0
+        buckets["100-500ms"] = 0
+        buckets["500ms+"] = 0
+        for e in self.monitor_enter_events:
+            dur_ms = parse_duration_iso(e["values"].get("duration", 0))
+            if dur_ms < 1:
+                buckets["0-1ms"] += 1
+            elif dur_ms < 5:
+                buckets["1-5ms"] += 1
+            elif dur_ms < 10:
+                buckets["5-10ms"] += 1
+            elif dur_ms < 50:
+                buckets["10-50ms"] += 1
+            elif dur_ms < 100:
+                buckets["50-100ms"] += 1
+            elif dur_ms < 500:
+                buckets["100-500ms"] += 1
+            else:
+                buckets["500ms+"] += 1
+        return buckets
+
+    def monitor_contention_longest(self, n: int = 5) -> list[tuple[float, str, str, str]]:
+        """
+        Top N longest individual monitor-enter events with app-level stack traces.
+
+        Returns list of (duration_ms, thread, monitor_class, stack_signature).
+        Stack traces are filtered to application code only (first 8 app frames).
+        """
+        tagged = []
+        for e in self.monitor_enter_events:
+            v = e["values"]
+            dur_ms = parse_duration_iso(v.get("duration", 0))
+            frames = dig(v, "stackTrace", "frames", default=[])
+            app_frames = app_stack_frames(frames, max_frames=8)
+            sig = stack_signature(app_frames, depth=8) if app_frames else "(no app frames)"
+            thread = dig(v, "eventThread", "javaName", default="?")
+            cls = dig(v, "monitorClass", "name", default="?")
+            tagged.append((dur_ms, thread, cls, sig))
+        tagged.sort(key=lambda t: t[0], reverse=True)
+        return tagged[:n]
+
+    def monitor_contention_by_thread(self) -> Counter:
+        """
+        Group monitor contention total wait time by thread name.
+
+        Reveals which threads suffer most from lock contention.
+        High values on a single thread suggest it's a serialization point.
+        """
+        c: Counter[str] = Counter()
+        for e in self.monitor_enter_events:
+            v = e["values"]
+            thread = dig(v, "eventThread", "javaName", default="?")
+            c[thread] += parse_duration_iso(v.get("duration", 0))
+        return c
+
+    def monitor_previous_owner_top(self, n: int = 15) -> list[tuple[str, str, float]]:
+        """
+        Top N previous-owner threads for contended monitors.
+
+        The `previousOwner` field in JavaMonitorEnter tells you which thread
+        was holding the lock when the waiting thread tried to acquire it.
+        Returns list of (monitor_class, previous_owner_thread, total_wait_ms).
+        """
+        c: Counter[tuple[str, str]] = Counter()
+        for e in self.monitor_enter_events:
+            v = e["values"]
+            cls = dig(v, "monitorClass", "name", default="unknown")
+            prev_owner = dig(v, "previousOwner", "javaName", default="?")
+            dur = parse_duration_iso(v.get("duration", 0))
+            c[(cls, prev_owner)] += dur
+        return [(cls, owner, ms) for (cls, owner), ms in c.most_common(n)]
+
     # ── JIT Compilation Accessors ────────────────────────────────────────
 
     @property
@@ -952,6 +1118,40 @@ class JfrAnalysis:
     def exception_count(self) -> int:
         return len(self.exception_events)
 
+    @property
+    def error_throw_count(self) -> int:
+        return len(self.error_throw_events)
+
+    def error_by_class(self, n: int = 15) -> list[tuple[str, int]]:
+        """
+        Top N thrown-error classes by count. Requires jdk.JavaErrorThrow,
+        which (like jdk.JavaExceptionThrow) is NOT enabled under the default
+        `profile` template on most JDK versions.
+        """
+        c: Counter[str] = Counter()
+        for e in self.error_throw_events:
+            v = e["values"]
+            cls = dig(v, "thrownClass", "name", default="unknown")
+            c[cls] += 1
+        return c.most_common(n)
+
+    def exception_and_error_combined(self, n: int = 25) -> list[tuple[str, int, str]]:
+        """
+        Combined exception and error throw counts, tagged by kind.
+
+        Returns list of (class_name, count, kind) where kind is 'Exception' or 'Error'.
+        """
+        c: Counter[tuple[str, str]] = Counter()
+        for e in self.exception_events:
+            v = e["values"]
+            cls = dig(v, "thrownClass", "name", default="unknown")
+            c[(cls, "Exception")] += 1
+        for e in self.error_throw_events:
+            v = e["values"]
+            cls = dig(v, "thrownClass", "name", default="unknown")
+            c[(cls, "Error")] += 1
+        return [(cls, cnt, kind) for (cls, kind), cnt in c.most_common(n)]
+
     # ── I/O Accessors ────────────────────────────────────────────────────
 
     def io_socket_summary(self) -> dict:
@@ -991,6 +1191,83 @@ class JfrAnalysis:
             v = e["values"]
             c[v.get("path", "?")] += parse_duration_iso(v.get("duration", 0))
         return c.most_common(n)
+
+    def io_socket_longest(self, n: int = 10) -> list[tuple[str, float, str, str, str]]:
+        """
+        Top N longest individual socket I/O events with thread context.
+
+        Returns list of (kind, duration_ms, thread, host, top_frame).
+        Kind is "READ" or "WRITE".
+        """
+        tagged = []
+        for e in self.socket_read_events:
+            v = e["values"]
+            dur = parse_duration_iso(v.get("duration", 0))
+            host = v.get("host", "?")
+            thread = dig(v, "eventThread", "javaName", default="?")
+            frames = dig(v, "stackTrace", "frames", default=[])
+            top = method_sig(frames[0]) if frames else "?"
+            tagged.append(("READ", dur, thread, host, top))
+        for e in self.socket_write_events:
+            v = e["values"]
+            dur = parse_duration_iso(v.get("duration", 0))
+            host = v.get("host", "?")
+            thread = dig(v, "eventThread", "javaName", default="?")
+            frames = dig(v, "stackTrace", "frames", default=[])
+            top = method_sig(frames[0]) if frames else "?"
+            tagged.append(("WRITE", dur, thread, host, top))
+        tagged.sort(key=lambda t: t[1], reverse=True)
+        return tagged[:n]
+
+    def io_file_longest(self, n: int = 10) -> list[tuple[str, float, str, str]]:
+        """
+        Top N longest individual file I/O events with thread context.
+
+        Returns list of (kind, duration_ms, thread, path).
+        Kind is "READ" or "WRITE".
+        """
+        tagged = []
+        for e in self.file_read_events:
+            v = e["values"]
+            dur = parse_duration_iso(v.get("duration", 0))
+            path = v.get("path", "?")
+            thread = dig(v, "eventThread", "javaName", default="?")
+            tagged.append(("READ", dur, thread, path))
+        for e in self.file_write_events:
+            v = e["values"]
+            dur = parse_duration_iso(v.get("duration", 0))
+            path = v.get("path", "?")
+            thread = dig(v, "eventThread", "javaName", default="?")
+            tagged.append(("WRITE", dur, thread, path))
+        tagged.sort(key=lambda t: t[1], reverse=True)
+        return tagged[:n]
+
+    def io_socket_summary_filtered(self) -> dict:
+        """
+        Socket I/O summary excluding RMI/JMX profiler noise.
+
+        Threads whose name contains 'RMI' or 'JMX' are filtered out so the
+        report focuses on application I/O. Includes the count and percentage
+        of events that were filtered.
+        """
+        filtered_reads = [e for e in self.socket_read_events
+                          if "RMI" not in dig(e, "values", "eventThread", "javaName", default="")
+                          and "JMX" not in dig(e, "values", "eventThread", "javaName", default="")]
+        filtered_writes = [e for e in self.socket_write_events
+                           if "RMI" not in dig(e, "values", "eventThread", "javaName", default="")
+                           and "JMX" not in dig(e, "values", "eventThread", "javaName", default="")]
+        read_bytes = sum(e["values"].get("bytesRead", 0) or 0 for e in filtered_reads)
+        write_bytes = sum(e["values"].get("bytesWritten", 0) or 0 for e in filtered_writes)
+        read_ms = sum(parse_duration_iso(e["values"].get("duration", 0)) for e in filtered_reads)
+        write_ms = sum(parse_duration_iso(e["values"].get("duration", 0)) for e in filtered_writes)
+        total_reads = len(self.socket_read_events)
+        total_writes = len(self.socket_write_events)
+        return {
+            "read_count": len(filtered_reads), "read_bytes": read_bytes, "read_ms": read_ms,
+            "write_count": len(filtered_writes), "write_bytes": write_bytes, "write_ms": write_ms,
+            "filtered_reads": total_reads - len(filtered_reads),
+            "filtered_writes": total_writes - len(filtered_writes),
+        }
 
     # ── CPU Load Accessors ───────────────────────────────────────────────
 
@@ -1129,6 +1406,7 @@ def report_single(analysis: JfrAnalysis):
     print(f"  Duration:        {analysis.recording_duration_s():.3f} s")
     print(f"  Chunks:          {analysis.recording_chunks()}")
     print(f"  JVM version:     {analysis.jvm_version()}")
+    print(f"  GC algorithm:    {analysis.gc_algorithm_name}")
     print(f"  PID:             {analysis.pid()}")
     print(f"  JVM arguments:   {analysis.jvm_arguments()}")
     print(f"  Java arguments:  {analysis.java_arguments()}")
@@ -1151,6 +1429,15 @@ def report_single(analysis: JfrAnalysis):
     _tbl_sep([50, 7, 7])
     for t, c in threads.most_common(15):
         _tbl_row(f"  {t[:48]:<48} {c:>7d} {c/total*100:>6.1f}%")
+
+    callers = analysis.cpu_caller_counts()
+    if callers:
+        _tbl_title("Top 20 Callers (second frame — who calls the hot method)", 80)
+        _tbl_hdr(f"  {'Caller (index-1 frame)':<70} {'Count':>7} {'Pct':>7}")
+        _tbl_sep([70, 7, 7])
+        caller_total = sum(callers.values()) or 1
+        for method, count in callers.most_common(20):
+            _tbl_row(f"  {method[:68]:<68} {count:>7d} {count/caller_total*100:>6.1f}%")
 
     print_header("TOP CPU STACK SIGNATURES (top 5 frames)")
     print_note("Full call chains showing WHY a leaf method is hot — the leaf tells WHAT is burning CPU, the stack tells WHY it's being called. Deep framework call chains -> framework overhead dominates; shallow chains -> application logic is the main cost.")
@@ -1315,6 +1602,53 @@ def report_single(analysis: JfrAnalysis):
         for cls, ms, cnt in top_park:
             _tbl_row(f"  {cls[:48]:<48} {ms:>16,.1f} {cnt:>10,d}")
 
+    # ── Lock Contention: Duration Distribution ─────────────────────────
+    distribution = analysis.monitor_contention_distribution()
+    if any(distribution.values()):
+        _tbl_title("Monitor Enter Duration Distribution", 60)
+        print_note("Shows how contention is distributed by severity. Dominance in upper buckets (100ms+) means threads experience long stalls. Dominance in lower buckets with many events means frequent short contention — possibly from many threads hitting the same lock briefly.")
+        _tbl_hdr(f"  {'Bucket':<15} {'Events':>10} {'Bar':>22}")
+        _tbl_sep([15, 10, 22])
+        total_dist = sum(distribution.values()) or 1
+        bucket_order = ["0-1ms", "1-5ms", "5-10ms", "10-50ms", "50-100ms", "100-500ms", "500ms+"]
+        for bucket in bucket_order:
+            cnt = distribution[bucket]
+            pct_dist = cnt / total_dist * 100
+            _tbl_row(f"  {bucket:<15} {cnt:>10,d} {bar(pct_dist, 20):>20} {pct_dist:.0f}%")
+
+    # ── Lock Contention: Longest Individual Events ──────────────────────
+    longest_mon = analysis.monitor_contention_longest(5)
+    if longest_mon:
+        _tbl_title("Longest Individual Monitor Enter Events (app-level stacks)", 90)
+        print_note("Individual long-contention events with application-code stack traces. The stack shows WHERE the contention occurred in your code, filtered to exclude JDK/framework frames.")
+        _tbl_hdr(f"  {'Dur (ms)':>10} {'Thread':<22} {'Monitor':<30} {'App Stack (top 8 app frames)':<40}")
+        _tbl_sep([10, 22, 30, 40])
+        for dur_ms, thread, cls, sig in longest_mon:
+            _tbl_row(f"  {dur_ms:>10,.1f} {thread[:20]:<20} {cls[:28]:<28}")
+            for line in sig.split(" -> "):
+                print(f"      {line}")
+
+    # ── Lock Contention: By Thread ──────────────────────────────────────
+    mon_by_thread = analysis.monitor_contention_by_thread()
+    if mon_by_thread:
+        _tbl_title("Monitor Contention by Thread", 70)
+        print_note("Threads that spend the most time waiting for monitors. A single thread with disproportionately high wait time suggests it's the main victim of contention.")
+        _tbl_hdr(f"  {'Thread':<40} {'Wait (ms)':>14} {'Pct':>7}")
+        _tbl_sep([40, 14, 7])
+        total_mon_thread = sum(mon_by_thread.values()) or 1
+        for thread, dur in mon_by_thread.most_common(15):
+            _tbl_row(f"  {thread[:38]:<38} {dur:>14,.1f} {dur/total_mon_thread*100:>6.1f}%")
+
+    # ── Lock Contention: Previous Owner ─────────────────────────────────
+    prev_owners = analysis.monitor_previous_owner_top(15)
+    if prev_owners:
+        _tbl_title("Previous Owner Analysis (who held the lock)", 90)
+        print_note("Shows which thread was HOLDING the lock when another thread tried to acquire it and had to wait. The 'previousOwner' field identifies the root cause — the thread that should release the lock faster or hold it for a shorter scope.")
+        _tbl_hdr(f"  {'Monitor Class':<40} {'Held By (previousOwner)':<30} {'Total Wait (ms)':>17}")
+        _tbl_sep([40, 30, 17])
+        for cls, owner, ms in prev_owners:
+            _tbl_row(f"  {cls[:38]:<38} {owner[:28]:<28} {ms:>17,.1f}")
+
     # ── Section 11: JIT Compilation ──────────────────────────────────────
     print_header("JIT COMPILATION")
     print_note("Compile time = CPU spent optimizing hot methods. High compile time during startup -> code churn as methods are compiled/recompiled. C1-only (TieredStopAtLevel=1) disables C2, trading peak throughput for faster startup & zero C2 compilation CPU. Level 0=interpreter, 1-3=C1 (increasing profiling), 4=C2 (most expensive, highest optimization).")
@@ -1367,6 +1701,38 @@ def report_single(analysis: JfrAnalysis):
         for path, ms in top_paths:
             _tbl_row(f"  {path[:63]:<63} {ms:>15,.1f}")
 
+    # ── I/O: RMI/JMX Filtering ───────────────────────────────────────────
+    sock_filt = analysis.io_socket_summary_filtered()
+    if sock_filt['filtered_reads'] > 0 or sock_filt['filtered_writes'] > 0:
+        print_subheader("Application-Level Socket I/O (RMI/JMX noise excluded)")
+        print_note("RMI TCP Connection threads are JMX/IntelliJ profiler noise — filtered out below to show application-level I/O only. If your app legitimately uses RMI for business logic, the filtered counts are still shown so you can judge relevance.")
+        if sock_filt['filtered_reads']:
+            print(f"  Filtered out: {sock_filt['filtered_reads']:,} RMI/JMX reads, "
+                  f"{sock_filt['filtered_writes']:,} RMI/JMX writes")
+        print(f"  App socket reads: {sock_filt['read_count']:,} "
+              f"({format_bytes(sock_filt['read_bytes'])}, {sock_filt['read_ms']:,.1f} ms wait)")
+        print(f"  App socket writes: {sock_filt['write_count']:,} "
+              f"({format_bytes(sock_filt['write_bytes'])}, {sock_filt['write_ms']:,.1f} ms wait)")
+
+    # ── I/O: Longest Individual Events ────────────────────────────────────
+    longest_sock = analysis.io_socket_longest(5)
+    if longest_sock:
+        _tbl_title("Longest Individual Socket I/O Events", 90)
+        print_note("Individual socket events that took the longest wall time. Long reads on startup-critical threads -> investigate whether the remote endpoint can be made faster or the data can be cached locally.")
+        _tbl_hdr(f"  {'Kind':<6} {'Dur (ms)':>10} {'Thread':<22} {'Host':<30} {'Top Frame':<30}")
+        _tbl_sep([6, 10, 22, 30, 30])
+        for kind, dur, thread, host, top in longest_sock:
+            _tbl_row(f"  {kind:<6} {dur:>10,.1f} {thread[:20]:<20} {host[:28]:<28} {top[:28]:<28}")
+
+    longest_file = analysis.io_file_longest(5)
+    if longest_file:
+        _tbl_title("Longest Individual File I/O Events", 90)
+        print_note("Individual file events with the highest latency. Long reads from JAR files during startup -> investigate CDS to bypass JAR scanning.")
+        _tbl_hdr(f"  {'Kind':<6} {'Dur (ms)':>10} {'Thread':<22} {'Path':<45}")
+        _tbl_sep([6, 10, 22, 45])
+        for kind, dur, thread, path in longest_file:
+            _tbl_row(f"  {kind:<6} {dur:>10,.1f} {thread[:20]:<20} {path[:43]:<43}")
+
     # ── Section 13: CPU Load Timeline ────────────────────────────────────
     print_header("CPU LOAD TIMELINE")
     print_note("JVM user% = app code CPU; system% = kernel time (I/O syscalls, some GC). Machine total near 100% -> CPU saturated. High system% relative to user% -> I/O or syscall bottleneck rather than pure computation. Correlate with I/O and GC sections.")
@@ -1404,10 +1770,11 @@ def report_single(analysis: JfrAnalysis):
 
     # ── Section 15: Exceptions ───────────────────────────────────────────
     print_header("EXCEPTIONS")
-    print_note("Requires jdk.JavaExceptionThrow, which is NOT enabled under the default `profile` template on most JDK versions — an empty result below more often means 'not recorded' than 'no exceptions were thrown'. If you need this data, explicitly enable the event when starting the recording. Each throw costs real CPU for stack-trace capture, even when the exception is caught and handled — exception-driven control flow on a hot path is worth flagging.")
+    print_note("Requires jdk.JavaExceptionThrow (and jdk.JavaErrorThrow for errors), which are NOT enabled under the default `profile` template on most JDK versions — an empty result below more often means 'not recorded' than 'no exceptions were thrown'. If you need this data, explicitly enable the event when starting the recording. Each throw costs real CPU for stack-trace capture, even when the exception is caught and handled — exception-driven control flow on a hot path is worth flagging.")
     print(f"\n  Exception throw events: {analysis.exception_count:,}")
-    if analysis.exception_count == 0:
-        print("  (Event not enabled for this recording, or genuinely zero exceptions.)")
+    print(f"  Error throw events:     {analysis.error_throw_count:,}")
+    if analysis.exception_count == 0 and analysis.error_throw_count == 0:
+        print("  (Events not enabled for this recording, or genuinely zero exceptions/errors.)")
     top_exc = analysis.exception_by_class(25)
     if top_exc:
         _tbl_title("Top Thrown Exception Classes", 70)
@@ -1415,6 +1782,22 @@ def report_single(analysis: JfrAnalysis):
         _tbl_sep([50, 10])
         for cls, cnt in top_exc:
             _tbl_row(f"  {cls[:48]:<48} {cnt:>10,d}")
+    top_errors = analysis.error_by_class(15)
+    if top_errors:
+        _tbl_title("Top Thrown Error Classes", 70)
+        _tbl_hdr(f"  {'Class':<50} {'Count':>10}")
+        _tbl_sep([50, 10])
+        for cls, cnt in top_errors:
+            _tbl_row(f"  {cls[:48]:<48} {cnt:>10,d}")
+
+    combined_exc_err = analysis.exception_and_error_combined(25)
+    if combined_exc_err and analysis.error_throw_count > 0:
+        _tbl_title("Combined Exceptions + Errors", 70)
+        _tbl_hdr(f"  {'Class':<48} {'Kind':<10} {'Count':>10}")
+        _tbl_sep([48, 10, 10])
+        for cls, cnt, kind in combined_exc_err:
+            _tbl_row(f"  {cls[:46]:<46} {kind:<10} {cnt:>10,d}")
+
     top_exc_stacks = analysis.exception_top_stacks(15)
     if top_exc_stacks:
         _tbl_title("Top Throw Sites (top 4 frames)", 90)
@@ -1439,8 +1822,8 @@ def report_comparison(before: JfrAnalysis, after: JfrAnalysis):
     """
     print_header("BEFORE vs AFTER COMPARISON")
     print_note("Side-by-side delta view. ELIMINATED = was present in Before but absent in After. NEW = appeared only in After. Focus on large-magnitude deltas; small changes may be noise from slightly different workload timing or sampling variance. A valid comparison assumes the same workload, duration, JVM version, and GC algorithm in both recordings — a comparison across different collectors will show mostly noise in the GC section.")
-    print(f"  Before: {before.name}  ({before.recording_duration_s():.3f}s, JVM {before.jvm_version()})")
-    print(f"  After:  {after.name}  ({after.recording_duration_s():.3f}s, JVM {after.jvm_version()})")
+    print(f"  Before: {before.name}  ({before.recording_duration_s():.3f}s, JVM {before.jvm_version()}, GC {before.gc_algorithm_name})")
+    print(f"  After:  {after.name}  ({after.recording_duration_s():.3f}s, JVM {after.jvm_version()}, GC {after.gc_algorithm_name})")
 
     # ── Section 1: Allocation Comparison ─────────────────────────────────
     print_header("ALLOCATION COMPARISON (sampled)")
@@ -1708,11 +2091,13 @@ def report_comparison(before: JfrAnalysis, after: JfrAnalysis):
 
     # ── Section 14: Exception Comparison ─────────────────────────────────
     print_header("EXCEPTION COMPARISON")
-    print_note("Only meaningful if jdk.JavaExceptionThrow was enabled in BOTH recordings — otherwise a delta here just reflects a settings difference, not a behavior change.")
+    print_note("Only meaningful if jdk.JavaExceptionThrow / jdk.JavaErrorThrow were enabled in BOTH recordings — otherwise a delta here just reflects a settings difference, not a behavior change.")
     _tbl_hdr(f"\n  {'Metric':<30} {'Before':>15} {'After':>15} {'Change':>15}")
     _tbl_sep([30, 15, 15, 15])
     _tbl_row(f"  {'Exceptions thrown':<30} {before.exception_count:>15,d} {after.exception_count:>15,d} "
              f"{after.exception_count-before.exception_count:>+15,d} ({pct_change(before.exception_count, after.exception_count)})")
+    _tbl_row(f"  {'Errors thrown':<30} {before.error_throw_count:>15,d} {after.error_throw_count:>15,d} "
+             f"{after.error_throw_count-before.error_throw_count:>+15,d} ({pct_change(before.error_throw_count, after.error_throw_count)})")
 
     # ── Section 15: Overall Summary ──────────────────────────────────────
     print_header("SUMMARY")
