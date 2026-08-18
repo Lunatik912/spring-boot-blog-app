@@ -25,6 +25,13 @@ resource "azurerm_subnet" "container_apps" {
   }
 }
 
+resource "azurerm_container_app_environment" "dev" {
+  name                       = var.container_apps_environment_name
+  location                   = azurerm_resource_group.main.location
+  resource_group_name        = azurerm_resource_group.main.name
+  infrastructure_subnet_id   = azurerm_subnet.container_apps.id
+}
+
 resource "azurerm_subnet" "aks" {
   name                 = "aks-subnet"
   resource_group_name  = azurerm_resource_group.main.name
