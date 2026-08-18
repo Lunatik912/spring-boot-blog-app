@@ -1,5 +1,5 @@
 ## this is conventional process
-FROM openjdk:21-slim
+FROM eclipse-temurin:21-jre
 VOLUME /tmp
 VOLUME /X/attachments
 COPY target/*.jar app.jar
