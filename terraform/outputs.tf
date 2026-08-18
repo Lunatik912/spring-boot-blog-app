@@ -17,3 +17,8 @@ output "aks_subnet_id" {
   description = "ID of the AKS subnet"
   value       = azurerm_subnet.aks.id
 }
+
+output "acr_login_server" {
+  description = "Login server of the Azure Container Registry"
+  value       = azurerm_container_registry.main.login_server
+}
