@@ -1,0 +1,5 @@
+[[allowlists]]
+description = "Allow documented SonarQube example credentials in README"
+paths = ['''README\.md$''']
+regexTarget = "match"
+regexes = ['''curl -u admin:admin''']
