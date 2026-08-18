@@ -16,12 +16,15 @@ resource "azurerm_subnet" "container_apps" {
   virtual_network_name = azurerm_virtual_network.main.name
   address_prefixes     = ["10.0.1.0/24"]
 
-  delegation {
-    name = "container-apps-delegation"
+delegation {
+  name = "container-apps-delegation"
 
-    service_delegation {
-      name = "Microsoft.App/environments"
-    }
+  service_delegation {
+    name = "Microsoft.App/environments"
+
+    actions = [
+      "Microsoft.Network/virtualNetworks/subnets/join/action"
+    ]
   }
 }
 
