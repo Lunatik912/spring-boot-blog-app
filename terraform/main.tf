@@ -23,6 +23,12 @@ resource "azurerm_subnet" "container_apps" {
       name = "Microsoft.App/environments"
     }
   }
+
+  lifecycle {
+    ignore_changes = [
+      delegation
+    ]
+  }
 }
 
 resource "azurerm_container_app_environment" "dev" {
