@@ -16,12 +16,13 @@ resource "azurerm_subnet" "container_apps" {
   virtual_network_name = azurerm_virtual_network.main.name
   address_prefixes     = ["10.0.1.0/24"]
 
-delegation {
-  name = "container-apps-delegation"
+  delegation {
+    name = "container-apps-delegation"
 
-    actions = [
-      "Microsoft.Network/virtualNetworks/subnets/join/action"
-    ]
+    service_delegation {
+      name = "Microsoft.App/environments"
+    }
+  }
 }
 
 resource "azurerm_container_app_environment" "dev" {
@@ -29,6 +30,11 @@ resource "azurerm_container_app_environment" "dev" {
   location                   = azurerm_resource_group.main.location
   resource_group_name        = azurerm_resource_group.main.name
   infrastructure_subnet_id   = azurerm_subnet.container_apps.id
+
+  workload_profile {
+    name                  = "Consumption"
+    workload_profile_type = "Consumption"
+  }
 }
 
 resource "azurerm_subnet" "aks" {
