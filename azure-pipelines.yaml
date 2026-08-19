@@ -51,13 +51,16 @@ stages:
       fetchDepth: 0
 
     # ========================================================
-    # 2. INSTALL TERRAFORM
+    # 2. VERIFY TERRAFORM
     # ========================================================
 
-    - task: TerraformInstaller@1
-      displayName: 'Install Terraform'
-      inputs:
-        terraformVersion: 'latest'
+    - powershell: |
+    Write-Host "=========================================="
+    Write-Host "Checking Terraform"
+    Write-Host "=========================================="
+
+    terraform version
+  displayName: 'Verify Terraform'
 
     # ========================================================
     # 3. TERRAFORM INIT
