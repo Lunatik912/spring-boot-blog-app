@@ -135,11 +135,18 @@ stages:
 
     - powershell: |
         Write-Host "Checking SonarQube Quality Gate..."
-        
+
         $projectKey = "$(sonarProjectKey)"
         $url = "$(sonarHostUrl)/api/qualitygates/project_status?projectKey=$projectKey"
 
-        $response = Invoke-RestMethod -Uri $url -Method Get
+        $headers = @{
+          Authorization = "Bearer $env:SONAR_TOKEN"
+        }
+
+        $response = Invoke-RestMethod `
+          -Uri $url `
+          -Method Get `
+          -Headers $headers
 
         $status = $response.projectStatus.status
 
@@ -152,6 +159,8 @@ stages:
 
         Write-Host "SonarQube Quality Gate passed."
       displayName: 'Validate Quality Gate'
+      env:
+        SONAR_TOKEN: $(SONAR_TOKEN)
 
 
 # ============================================================
