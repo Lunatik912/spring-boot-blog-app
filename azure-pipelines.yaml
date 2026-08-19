@@ -1,4 +1,3 @@
-```yaml
 trigger: none
 
 pool:
@@ -297,4 +296,3 @@ stages:
 
           kubectl rollout status deployment/spring-boot-blog-app `
             -n $(prodNamespace)
-```
