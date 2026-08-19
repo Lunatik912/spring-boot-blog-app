@@ -55,12 +55,13 @@ stages:
     # ========================================================
 
     - powershell: |
-    Write-Host "=========================================="
-    Write-Host "Checking Terraform"
-    Write-Host "=========================================="
+        Write-Host "=========================================="
+        Write-Host "Checking Terraform"
+        Write-Host "=========================================="
 
-    terraform version
-  displayName: 'Verify Terraform'
+        terraform version
+
+      displayName: 'Verify Terraform'
 
     # ========================================================
     # 3. TERRAFORM INIT
@@ -158,7 +159,6 @@ stages:
     # ========================================================
 
     - powershell: |
-
         $env:JAVA_HOME = "C:\Program Files\Java\jdk-21.0.12"
         $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
 
@@ -181,7 +181,6 @@ stages:
     # ========================================================
 
     - powershell: |
-
         Write-Host "=========================================="
         Write-Host "Running Gitleaks"
         Write-Host "=========================================="
@@ -195,7 +194,6 @@ stages:
     # ========================================================
 
     - powershell: |
-
         $env:JAVA_HOME = "C:\Program Files\Java\jdk-21.0.12"
         $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
 
@@ -212,7 +210,6 @@ stages:
     # ========================================================
 
     - powershell: |
-
         $env:JAVA_HOME = "C:\Program Files\Java\jdk-21.0.12"
         $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
 
@@ -235,7 +232,6 @@ stages:
     # ========================================================
 
     - powershell: |
-
         $env:JAVA_HOME = "C:\Program Files\Java\jdk-21.0.12"
         $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
 
@@ -250,6 +246,7 @@ stages:
           "-Dsonar.qualitygate.wait=true"
 
       displayName: 'SonarQube Analysis'
+
       env:
         SONAR_TOKEN: $(SONAR_TOKEN)
 
@@ -258,7 +255,6 @@ stages:
     # ========================================================
 
     - powershell: |
-
         Write-Host "=========================================="
         Write-Host "Checking SonarQube Quality Gate"
         Write-Host "=========================================="
@@ -289,6 +285,7 @@ stages:
         Write-Host "=========================================="
 
       displayName: 'SonarQube Quality Gate'
+
       env:
         SONAR_TOKEN: $(SONAR_TOKEN)
 
@@ -297,7 +294,6 @@ stages:
     # ========================================================
 
     - powershell: |
-
         Write-Host "=========================================="
         Write-Host "Docker Build"
         Write-Host "=========================================="
@@ -386,7 +382,6 @@ stages:
     # ========================================================
 
     - powershell: |
-
         Write-Host "=========================================="
         Write-Host "Deploying UAT"
         Write-Host "=========================================="
@@ -418,7 +413,6 @@ stages:
     # ========================================================
 
     - powershell: |
-
         Write-Host "=========================================="
         Write-Host "Deploying PROD"
         Write-Host "=========================================="
@@ -448,13 +442,13 @@ stages:
     # ========================================================
 
     - powershell: |
-
         Write-Host "=========================================="
         Write-Host "FINAL DEPLOYMENT STATUS"
         Write-Host "=========================================="
 
         Write-Host ""
         Write-Host "DEV Container App:"
+
         az containerapp show `
           --name $(containerAppName) `
           --resource-group $(resourceGroup) `
@@ -463,11 +457,13 @@ stages:
 
         Write-Host ""
         Write-Host "UAT:"
+
         kubectl get pods -n $(uatNamespace)
         kubectl get svc -n $(uatNamespace)
 
         Write-Host ""
         Write-Host "PROD:"
+
         kubectl get pods -n $(prodNamespace)
         kubectl get svc -n $(prodNamespace)
 
@@ -475,3 +471,5 @@ stages:
         Write-Host "=========================================="
         Write-Host "CI/CD PIPELINE COMPLETED SUCCESSFULLY"
         Write-Host "=========================================="
+
+      displayName: 'Final Deployment Verification'
