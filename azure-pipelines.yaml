@@ -5,15 +5,25 @@ pool:
 
 variables:
   azureServiceConnection: 'spring-boot-blog-app-azure'
+
+  # ACR
   acrName: 'springbootblogacr'
   acrLoginServer: 'springbootblogacr.azurecr.io'
   imageRepository: 'spring-boot-blog-app'
   imageTag: '$(Build.BuildId)'
+
+  # Azure Container App
   containerAppName: 'spring-boot-blog-app-dev'
+
+  # Azure
   resourceGroup: 'spring-boot-blog-app-rg'
+
+  # AKS
   aksClusterName: 'spring-boot-blog-aks'
   uatNamespace: 'uat'
   prodNamespace: 'prod'
+
+  # SonarQube
   sonarProjectKey: 'spring-boot-blog-app'
   sonarHostUrl: 'http://localhost:9000'
 
@@ -28,23 +38,124 @@ stages:
 
   jobs:
 
-  - job: Build_Test_Scan_Deploy
-    displayName: 'Build, Scan and Deploy'
+  - job: CompletePipeline
+    displayName: 'Terraform Build Scan and Deploy'
 
     steps:
 
     # ========================================================
-    # 1. CHECKOUT
+    # 1. CHECKOUT SOURCE CODE
     # ========================================================
 
     - checkout: self
       fetchDepth: 0
 
     # ========================================================
-    # 2. FORCE JAVA 21
+    # 2. INSTALL TERRAFORM
+    # ========================================================
+
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: 'latest'
+
+    # ========================================================
+    # 3. TERRAFORM INIT
+    # ========================================================
+
+    - task: AzureCLI@2
+      displayName: 'Terraform Init'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'ps'
+        scriptLocation: 'inlineScript'
+        workingDirectory: '$(Build.SourcesDirectory)/terraform'
+        inlineScript: |
+
+          Write-Host "=========================================="
+          Write-Host "Terraform Init"
+          Write-Host "=========================================="
+
+          terraform init -reconfigure `
+            -backend-config="resource_group_name=Lunatik-RG" `
+            -backend-config="storage_account_name=qwertystoracc" `
+            -backend-config="container_name=alpha-cont" `
+            -backend-config="key=spring-boot-blog-app.tfstate"
+
+    # ========================================================
+    # 4. TERRAFORM PLAN
+    # ========================================================
+
+    - task: AzureCLI@2
+      displayName: 'Terraform Plan'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'ps'
+        scriptLocation: 'inlineScript'
+        workingDirectory: '$(Build.SourcesDirectory)/terraform'
+        inlineScript: |
+
+          Write-Host "=========================================="
+          Write-Host "Terraform Plan"
+          Write-Host "=========================================="
+
+          terraform plan
+
+    # ========================================================
+    # 5. TERRAFORM APPLY
+    # ========================================================
+
+    - task: AzureCLI@2
+      displayName: 'Terraform Apply'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'ps'
+        scriptLocation: 'inlineScript'
+        workingDirectory: '$(Build.SourcesDirectory)/terraform'
+        inlineScript: |
+
+          Write-Host "=========================================="
+          Write-Host "Terraform Apply"
+          Write-Host "=========================================="
+
+          terraform apply -auto-approve
+
+    # ========================================================
+    # 6. VERIFY TERRAFORM RESOURCES
+    # ========================================================
+
+    - task: AzureCLI@2
+      displayName: 'Verify Azure Infrastructure'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'ps'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+
+          Write-Host "=========================================="
+          Write-Host "Verifying DEV Container App"
+          Write-Host "=========================================="
+
+          az containerapp show `
+            --name $(containerAppName) `
+            --resource-group $(resourceGroup) `
+            -o table
+
+          Write-Host "=========================================="
+          Write-Host "Verifying AKS"
+          Write-Host "=========================================="
+
+          az aks show `
+            --name $(aksClusterName) `
+            --resource-group $(resourceGroup) `
+            -o table
+
+    # ========================================================
+    # 7. JAVA 21
     # ========================================================
 
     - powershell: |
+
         $env:JAVA_HOME = "C:\Program Files\Java\jdk-21.0.12"
         $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
 
@@ -59,25 +170,29 @@ stages:
         Write-Host "=========================================="
 
         .\mvnw.cmd -version
+
       displayName: 'Configure Java 21'
 
     # ========================================================
-    # 3. GITLEAKS
+    # 8. GITLEAKS
     # ========================================================
 
     - powershell: |
+
         Write-Host "=========================================="
         Write-Host "Running Gitleaks"
         Write-Host "=========================================="
 
         gitleaks dir . --verbose
+
       displayName: 'Gitleaks Security Scan'
 
     # ========================================================
-    # 4. CHECKSTYLE / LINT
+    # 9. CHECKSTYLE / LINT
     # ========================================================
 
     - powershell: |
+
         $env:JAVA_HOME = "C:\Program Files\Java\jdk-21.0.12"
         $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
 
@@ -86,13 +201,15 @@ stages:
         Write-Host "=========================================="
 
         .\mvnw.cmd checkstyle:check
+
       displayName: 'Checkstyle / Lint'
 
     # ========================================================
-    # 5. MAVEN BUILD
+    # 10. MAVEN BUILD
     # ========================================================
 
     - powershell: |
+
         $env:JAVA_HOME = "C:\Program Files\Java\jdk-21.0.12"
         $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
 
@@ -103,37 +220,42 @@ stages:
         .\mvnw.cmd clean package -DskipTests
 
         Write-Host "=========================================="
-        Write-Host "Checking generated JAR"
+        Write-Host "Generated JAR Files"
         Write-Host "=========================================="
 
         Get-ChildItem -Path target -Filter *.jar
-      displayName: 'Maven Build'
+
+      displayName: 'Maven Build with Java 21'
 
     # ========================================================
-    # 6. SONARQUBE ANALYSIS
+    # 11. SONARQUBE ANALYSIS
     # ========================================================
 
     - powershell: |
+
         $env:JAVA_HOME = "C:\Program Files\Java\jdk-21.0.12"
         $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
 
         Write-Host "=========================================="
-        Write-Host "Running SonarQube Analysis"
+        Write-Host "SonarQube Analysis"
         Write-Host "=========================================="
 
         .\mvnw.cmd sonar:sonar `
           "-Dsonar.projectKey=$(sonarProjectKey)" `
           "-Dsonar.host.url=$(sonarHostUrl)" `
-          "-Dsonar.token=$(SONAR_TOKEN)"
+          "-Dsonar.token=$(SONAR_TOKEN)" `
+          "-Dsonar.qualitygate.wait=true"
+
       displayName: 'SonarQube Analysis'
       env:
         SONAR_TOKEN: $(SONAR_TOKEN)
 
     # ========================================================
-    # 7. SONARQUBE QUALITY GATE
+    # 12. SONARQUBE QUALITY GATE
     # ========================================================
 
     - powershell: |
+
         Write-Host "=========================================="
         Write-Host "Checking SonarQube Quality Gate"
         Write-Host "=========================================="
@@ -155,40 +277,43 @@ stages:
         Write-Host "SonarQube Quality Gate Status: $status"
 
         if ($status -ne "OK") {
-          Write-Error "SonarQube Quality Gate failed."
+          Write-Error "SonarQube Quality Gate FAILED."
           exit 1
         }
 
         Write-Host "=========================================="
         Write-Host "SonarQube Quality Gate PASSED"
         Write-Host "=========================================="
+
       displayName: 'SonarQube Quality Gate'
       env:
         SONAR_TOKEN: $(SONAR_TOKEN)
 
     # ========================================================
-    # 8. DOCKER BUILD
+    # 13. DOCKER BUILD
     # ========================================================
 
     - powershell: |
+
         Write-Host "=========================================="
-        Write-Host "Building Docker Image"
+        Write-Host "Docker Build"
         Write-Host "=========================================="
 
         docker build `
           -t "$(acrLoginServer)/$(imageRepository):$(imageTag)" `
           .
 
-        Write-Host "Docker image created:"
+        Write-Host "Docker image:"
         Write-Host "$(acrLoginServer)/$(imageRepository):$(imageTag)"
+
       displayName: 'Docker Build'
 
     # ========================================================
-    # 9. LOGIN TO AZURE + ACR PUSH
+    # 14. ACR PUSH
     # ========================================================
 
     - task: AzureCLI@2
-      displayName: 'Push Docker Image to ACR'
+      displayName: 'Push Image to ACR'
       inputs:
         azureSubscription: '$(azureServiceConnection)'
         scriptType: 'ps'
@@ -196,19 +321,19 @@ stages:
         inlineScript: |
 
           Write-Host "=========================================="
-          Write-Host "Logging into Azure Container Registry"
+          Write-Host "Login to ACR"
           Write-Host "=========================================="
 
           az acr login --name $(acrName)
 
           Write-Host "=========================================="
-          Write-Host "Pushing Docker Image"
+          Write-Host "Push Image"
           Write-Host "=========================================="
 
           docker push "$(acrLoginServer)/$(imageRepository):$(imageTag)"
 
     # ========================================================
-    # 10. DEPLOY DEV → AZURE CONTAINER APP
+    # 15. DEPLOY DEV → CONTAINER APP
     # ========================================================
 
     - task: AzureCLI@2
@@ -228,8 +353,10 @@ stages:
             --resource-group $(resourceGroup) `
             --image "$(acrLoginServer)/$(imageRepository):$(imageTag)"
 
+          Write-Host "DEV deployment completed."
+
     # ========================================================
-    # 11. CONNECT TO AKS
+    # 16. CONNECT TO AKS
     # ========================================================
 
     - task: AzureCLI@2
@@ -252,7 +379,7 @@ stages:
           kubectl get nodes
 
     # ========================================================
-    # 12. DEPLOY UAT → AKS
+    # 17. DEPLOY UAT → AKS
     # ========================================================
 
     - powershell: |
@@ -263,24 +390,28 @@ stages:
 
         kubectl apply -f kubernetes/namespace.yaml
 
-        kubectl apply -f kubernetes/deployment.yaml `
+        kubectl apply `
+          -f kubernetes/deployment.yaml `
           -n $(uatNamespace)
 
-        kubectl apply -f kubernetes/service-uat.yaml `
+        kubectl apply `
+          -f kubernetes/service-uat.yaml `
           -n $(uatNamespace)
 
-        kubectl set image deployment/spring-boot-blog-app `
+        kubectl set image `
+          deployment/spring-boot-blog-app `
           spring-boot-blog-app="$(acrLoginServer)/$(imageRepository):$(imageTag)" `
           -n $(uatNamespace)
 
-        kubectl rollout status deployment/spring-boot-blog-app `
+        kubectl rollout status `
+          deployment/spring-boot-blog-app `
           -n $(uatNamespace) `
           --timeout=180s
 
         Write-Host "UAT deployment completed."
 
     # ========================================================
-    # 13. DEPLOY PROD → AKS
+    # 18. DEPLOY PROD → AKS
     # ========================================================
 
     - powershell: |
@@ -289,24 +420,28 @@ stages:
         Write-Host "Deploying PROD"
         Write-Host "=========================================="
 
-        kubectl apply -f kubernetes/deployment.yaml `
+        kubectl apply `
+          -f kubernetes/deployment.yaml `
           -n $(prodNamespace)
 
-        kubectl apply -f kubernetes/service-prod.yaml `
+        kubectl apply `
+          -f kubernetes/service-prod.yaml `
           -n $(prodNamespace)
 
-        kubectl set image deployment/spring-boot-blog-app `
+        kubectl set image `
+          deployment/spring-boot-blog-app `
           spring-boot-blog-app="$(acrLoginServer)/$(imageRepository):$(imageTag)" `
           -n $(prodNamespace)
 
-        kubectl rollout status deployment/spring-boot-blog-app `
+        kubectl rollout status `
+          deployment/spring-boot-blog-app `
           -n $(prodNamespace) `
           --timeout=180s
 
         Write-Host "PROD deployment completed."
 
     # ========================================================
-    # 14. FINAL VERIFICATION
+    # 19. FINAL VERIFICATION
     # ========================================================
 
     - powershell: |
@@ -314,6 +449,14 @@ stages:
         Write-Host "=========================================="
         Write-Host "FINAL DEPLOYMENT STATUS"
         Write-Host "=========================================="
+
+        Write-Host ""
+        Write-Host "DEV Container App:"
+        az containerapp show `
+          --name $(containerAppName) `
+          --resource-group $(resourceGroup) `
+          --query "{name:name,provisioningState:properties.provisioningState}" `
+          -o table
 
         Write-Host ""
         Write-Host "UAT:"
@@ -329,3 +472,4 @@ stages:
         Write-Host "=========================================="
         Write-Host "CI/CD PIPELINE COMPLETED SUCCESSFULLY"
         Write-Host "=========================================="
+```
