@@ -472,4 +472,3 @@ stages:
         Write-Host "=========================================="
         Write-Host "CI/CD PIPELINE COMPLETED SUCCESSFULLY"
         Write-Host "=========================================="
-```
