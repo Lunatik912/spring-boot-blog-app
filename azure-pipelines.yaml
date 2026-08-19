@@ -15,7 +15,7 @@ variables:
   uatNamespace: 'uat'
   prodNamespace: 'prod'
   sonarProjectKey: 'spring-boot-blog-app'
-  sonarHostUrl: 'http://localhost:9000'
+  sonarHostUrl: 'http://192.168.1.6:9000'
 
 stages:
 
