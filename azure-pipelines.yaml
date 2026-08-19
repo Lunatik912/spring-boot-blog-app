@@ -1,3 +1,4 @@
+```yaml
 trigger: none
 
 pool:
@@ -53,8 +54,15 @@ stages:
     - checkout: self
 
     - powershell: |
+        $env:JAVA_HOME = "C:\Program Files\Java\jdk-21.0.12"
+        $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
+
+        Write-Host "Using Java 21 for Checkstyle"
+        java -version
+        .\mvnw.cmd -version
+
         .\mvnw.cmd checkstyle:check
-      displayName: 'Run Maven Checkstyle'
+      displayName: 'Run Maven Checkstyle with Java 21'
 
 
 # ============================================================
@@ -72,8 +80,15 @@ stages:
     - checkout: self
 
     - powershell: |
+        $env:JAVA_HOME = "C:\Program Files\Java\jdk-21.0.12"
+        $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
+
+        Write-Host "Using Java 21 for Maven Build"
+        java -version
+        .\mvnw.cmd -version
+
         .\mvnw.cmd clean package -DskipTests
-      displayName: 'Maven Package'
+      displayName: 'Maven Package with Java 21'
 
 
 # ============================================================
@@ -91,11 +106,18 @@ stages:
     - checkout: self
 
     - powershell: |
+        $env:JAVA_HOME = "C:\Program Files\Java\jdk-21.0.12"
+        $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
+
+        Write-Host "Using Java 21 for SonarQube"
+        java -version
+        .\mvnw.cmd -version
+
         .\mvnw.cmd clean verify sonar:sonar `
           "-Dsonar.projectKey=$(sonarProjectKey)" `
           "-Dsonar.host.url=$(sonarHostUrl)" `
           "-Dsonar.token=$(SONAR_TOKEN)"
-      displayName: 'SonarQube Scan'
+      displayName: 'SonarQube Scan with Java 21'
       env:
         SONAR_TOKEN: $(SONAR_TOKEN)
 
@@ -275,3 +297,4 @@ stages:
 
           kubectl rollout status deployment/spring-boot-blog-app `
             -n $(prodNamespace)
+```
