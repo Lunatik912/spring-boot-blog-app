@@ -1,0 +1,279 @@
+```yaml
+trigger: none
+
+pool:
+  name: B13-Pool
+
+variables:
+  azureServiceConnection: 'spring-boot-blog-app-azure'
+  acrName: 'springbootblogacr'
+  acrLoginServer: 'springbootblogacr.azurecr.io'
+  imageRepository: 'spring-boot-blog-app'
+  imageTag: '$(Build.BuildId)'
+  containerAppName: 'spring-boot-blog-app-dev'
+  resourceGroup: 'spring-boot-blog-app-rg'
+  aksClusterName: 'spring-boot-blog-aks'
+  uatNamespace: 'uat'
+  prodNamespace: 'prod'
+  sonarProjectKey: 'spring-boot-blog-app'
+  sonarHostUrl: 'http://localhost:9000'
+
+stages:
+
+# ============================================================
+# 1. GITLEAKS
+# ============================================================
+
+- stage: Gitleaks
+  displayName: 'Gitleaks Security Scan'
+  jobs:
+  - job: GitleaksScan
+    displayName: 'Scan Repository for Secrets'
+    steps:
+
+    - checkout: self
+      fetchDepth: 0
+
+    - powershell: |
+        gitleaks dir . --verbose
+      displayName: 'Run Gitleaks'
+
+
+# ============================================================
+# 2. CHECKSTYLE / LINT
+# ============================================================
+
+- stage: Lint
+  displayName: 'Checkstyle / Lint'
+  dependsOn: Gitleaks
+  jobs:
+  - job: Checkstyle
+    displayName: 'Run Checkstyle'
+    steps:
+
+    - checkout: self
+
+    - powershell: |
+        .\mvnw.cmd checkstyle:check
+      displayName: 'Run Maven Checkstyle'
+
+
+# ============================================================
+# 3. MAVEN BUILD
+# ============================================================
+
+- stage: MavenBuild
+  displayName: 'Maven Build'
+  dependsOn: Lint
+  jobs:
+  - job: Build
+    displayName: 'Build Spring Boot Application'
+    steps:
+
+    - checkout: self
+
+    - powershell: |
+        .\mvnw.cmd clean package -DskipTests
+      displayName: 'Maven Package'
+
+
+# ============================================================
+# 4. SONARQUBE ANALYSIS
+# ============================================================
+
+- stage: SonarQube
+  displayName: 'SonarQube Analysis'
+  dependsOn: MavenBuild
+  jobs:
+  - job: SonarAnalysis
+    displayName: 'Run SonarQube Analysis'
+    steps:
+
+    - checkout: self
+
+    - powershell: |
+        .\mvnw.cmd clean verify sonar:sonar `
+          "-Dsonar.projectKey=$(sonarProjectKey)" `
+          "-Dsonar.host.url=$(sonarHostUrl)" `
+          "-Dsonar.token=$(SONAR_TOKEN)"
+      displayName: 'SonarQube Scan'
+      env:
+        SONAR_TOKEN: $(SONAR_TOKEN)
+
+
+# ============================================================
+# 5. SONARQUBE QUALITY GATE
+# ============================================================
+
+- stage: QualityGate
+  displayName: 'SonarQube Quality Gate'
+  dependsOn: SonarQube
+  jobs:
+  - job: QualityGate
+    displayName: 'Check SonarQube Quality Gate'
+    steps:
+
+    - powershell: |
+        Write-Host "Checking SonarQube Quality Gate..."
+        
+        $projectKey = "$(sonarProjectKey)"
+        $url = "$(sonarHostUrl)/api/qualitygates/project_status?projectKey=$projectKey"
+
+        $response = Invoke-RestMethod -Uri $url -Method Get
+
+        $status = $response.projectStatus.status
+
+        Write-Host "SonarQube Quality Gate Status: $status"
+
+        if ($status -ne "OK") {
+          Write-Error "SonarQube Quality Gate failed."
+          exit 1
+        }
+
+        Write-Host "SonarQube Quality Gate passed."
+      displayName: 'Validate Quality Gate'
+
+
+# ============================================================
+# 6. DOCKER BUILD
+# ============================================================
+
+- stage: DockerBuild
+  displayName: 'Docker Build'
+  dependsOn: QualityGate
+  jobs:
+  - job: Docker
+    displayName: 'Build Docker Image'
+    steps:
+
+    - checkout: self
+
+    - powershell: |
+        docker build `
+          -t "$(acrLoginServer)/$(imageRepository):$(imageTag)" `
+          .
+      displayName: 'Build Docker Image'
+
+
+# ============================================================
+# 7. PUSH IMAGE TO ACR
+# ============================================================
+
+- stage: PushACR
+  displayName: 'Push Image to ACR'
+  dependsOn: DockerBuild
+  jobs:
+  - job: Push
+    displayName: 'Push Docker Image'
+    steps:
+
+    - checkout: self
+
+    - task: AzureCLI@2
+      displayName: 'Login to Azure and Push Image'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'ps'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+
+          az acr login --name $(acrName)
+
+          docker push "$(acrLoginServer)/$(imageRepository):$(imageTag)"
+
+
+# ============================================================
+# 8. DEPLOY DEV → AZURE CONTAINER APP
+# ============================================================
+
+- stage: DeployDEV
+  displayName: 'Deploy DEV - Container App'
+  dependsOn: PushACR
+  jobs:
+  - job: DeployDev
+    displayName: 'Deploy to Azure Container App'
+    steps:
+
+    - task: AzureCLI@2
+      displayName: 'Deploy DEV Container App'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'ps'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+
+          az containerapp update `
+            --name $(containerAppName) `
+            --resource-group $(resourceGroup) `
+            --image "$(acrLoginServer)/$(imageRepository):$(imageTag)"
+
+
+# ============================================================
+# 9. DEPLOY UAT → AKS
+# ============================================================
+
+- stage: DeployUAT
+  displayName: 'Deploy UAT - AKS'
+  dependsOn: DeployDEV
+  jobs:
+  - job: DeployUAT
+    displayName: 'Deploy to UAT Namespace'
+    steps:
+
+    - checkout: self
+
+    - task: AzureCLI@2
+      displayName: 'Connect to AKS'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'ps'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+
+          az aks get-credentials `
+            --resource-group $(resourceGroup) `
+            --name $(aksClusterName) `
+            --overwrite-existing
+
+          kubectl set image deployment/spring-boot-blog-app `
+            spring-boot-blog-app="$(acrLoginServer)/$(imageRepository):$(imageTag)" `
+            -n $(uatNamespace)
+
+          kubectl rollout status deployment/spring-boot-blog-app `
+            -n $(uatNamespace)
+
+
+# ============================================================
+# 10. DEPLOY PROD → AKS
+# ============================================================
+
+- stage: DeployPROD
+  displayName: 'Deploy PROD - AKS'
+  dependsOn: DeployUAT
+  jobs:
+  - job: DeployPROD
+    displayName: 'Deploy to PROD Namespace'
+    steps:
+
+    - checkout: self
+
+    - task: AzureCLI@2
+      displayName: 'Deploy to PROD'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'ps'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+
+          az aks get-credentials `
+            --resource-group $(resourceGroup) `
+            --name $(aksClusterName) `
+            --overwrite-existing
+
+          kubectl set image deployment/spring-boot-blog-app `
+            spring-boot-blog-app="$(acrLoginServer)/$(imageRepository):$(imageTag)" `
+            -n $(prodNamespace)
+
+          kubectl rollout status deployment/spring-boot-blog-app `
+            -n $(prodNamespace)
+```
