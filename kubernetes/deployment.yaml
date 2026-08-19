@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spring-boot-blog-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spring-boot-blog-app
+  template:
+    metadata:
+      labels:
+        app: spring-boot-blog-app
+    spec:
+      containers:
+        - name: spring-boot-blog-app
+          image: springbootblogacr.azurecr.io/spring-boot-blog-app:1.0
+          ports:
+            - containerPort: 8080
